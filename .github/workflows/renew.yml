@@ -2,7 +2,6 @@ name: FreeGameHost Auto Renew
 
 on:
   schedule:
-    # 每 2 小时执行一次（8 小时有效期 + 2 小时冷却）
     - cron: "15 */2 * * *"
   workflow_dispatch:
 
@@ -28,8 +27,17 @@ jobs:
           path: ~/.cache/ms-playwright
           key: playwright-${{ runner.os }}-1.49.1
 
+      - name: Restore & Save Session Cookies
+        uses: actions/cache@v4
+        with:
+          path: state
+          key: fgh-cookies-${{ github.run_id }}
+          restore-keys: |
+            fgh-cookies-
+
       - name: Install dependencies
         run: |
+          sudo apt-get update -qq && sudo apt-get install -y -qq ffmpeg
           pip install -r requirements.txt
           if [ "${{ steps.playwright-cache.outputs.cache-hit }}" != "true" ]; then
             playwright install chromium
@@ -55,6 +63,7 @@ jobs:
         env:
           FGH_USERNAME: ${{ secrets.FGH_USERNAME }}
           FGH_PASSWORD: ${{ secrets.FGH_PASSWORD }}
+          FGH_COOKIES: ${{ secrets.FGH_COOKIES }}
           FGH_SERVER_IDS: ${{ secrets.FGH_SERVER_IDS }}
           PROXY_URL: ${{ secrets.PROXY_URL }}
           TG_BOT_TOKEN: ${{ secrets.TG_BOT_TOKEN }}
