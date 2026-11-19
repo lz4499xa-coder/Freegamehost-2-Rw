@@ -2,13 +2,14 @@ name: FreeGameHost Auto Renew
 
 on:
   schedule:
+    # 每 2 小时执行一次（8 小时有效期 + 2 小时冷却）
     - cron: "15 */2 * * *"
   workflow_dispatch:
 
 jobs:
   renew:
     runs-on: ubuntu-latest
-    timeout-minutes: 8
+    timeout-minutes: 10
 
     steps:
       - name: Checkout repository
@@ -36,13 +37,21 @@ jobs:
             fgh-cookies-
 
       - name: Install dependencies
+        env:
+          DEBIAN_FRONTEND: noninteractive
         run: |
-          sudo apt-get update -qq && sudo apt-get install -y -qq ffmpeg
           pip install -r requirements.txt
+          if ! command -v ffmpeg >/dev/null 2>&1; then
+            sudo apt-get update -o Acquire::Retries=3 -o Acquire::http::Timeout=15
+            sudo env DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+              -o Dpkg::Options::="--force-confdef" \
+              -o Dpkg::Options::="--force-confold" \
+              ffmpeg
+          fi
           if [ "${{ steps.playwright-cache.outputs.cache-hit }}" != "true" ]; then
             playwright install chromium
           fi
-          playwright install-deps chromium
+          sudo env DEBIAN_FRONTEND=noninteractive "$(which playwright)" install-deps chromium
 
       - name: Install sing-box (if using hy2 proxy)
         env:
