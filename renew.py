@@ -1,6 +1,7 @@
 import html
 import json
 import os
+import random
 import re
 import shutil
 import socket
@@ -12,8 +13,13 @@ from urllib.parse import parse_qs, unquote, urlparse
 
 import requests
 import speech_recognition as sr
-from playwright.sync_api import TimeoutError as PlaywrightTimeoutError
-from playwright.sync_api import sync_playwright
+from patchright.sync_api import TimeoutError as PlaywrightTimeoutError
+from patchright.sync_api import sync_playwright
+
+try:
+    import imageio_ffmpeg
+except ImportError:
+    imageio_ffmpeg = None
 
 PANEL_URL = os.getenv("FGH_PANEL_URL", "https://panel.freegamehost.xyz").rstrip("/")
 USERNAME = os.getenv("FGH_USERNAME", "").strip()
@@ -25,7 +31,7 @@ TG_BOT_TOKEN = os.getenv("TG_BOT_TOKEN", "").strip()
 TG_CHAT_ID = os.getenv("TG_CHAT_ID", "").strip()
 
 LOCAL_PROXY_PORT = 10808
-USER_AGENT = (
+REQUESTS_USER_AGENT = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
     "AppleWebKit/537.36 (KHTML, like Gecko) "
     "Chrome/131.0.0.0 Safari/537.36"
@@ -36,39 +42,18 @@ COOKIE_FILE = os.path.join(STATE_DIR, "cookies.json")
 os.makedirs(SCREENSHOT_DIR, exist_ok=True)
 os.makedirs(STATE_DIR, exist_ok=True)
 
-# 持久拦截 Google CMP / Funding Choices 遮罩层
-BLOCK_CMP_INIT_SCRIPT = """
-Object.defineProperty(navigator, 'webdriver', {get: () => undefined});
-(() => {
-    const injectStyle = () => {
-        if (document.getElementById('fgh-anti-cmp-style')) return;
-        const style = document.createElement('style');
-        style.id = 'fgh-anti-cmp-style';
-        style.textContent = `
-            .fc-consent-root,
-            .fc-dialog-overlay,
-            .fc-dialog-container,
-            .fc-monetization-dialog-container,
-            [id*="sp_message_container"] {
-                display: none !important;
-                visibility: hidden !important;
-                pointer-events: none !important;
-                z-index: -9999 !important;
-            }
-            body, html {
-                overflow: auto !important;
-                pointer-events: auto !important;
-            }
-        `;
-        (document.head || document.documentElement).appendChild(style);
-    };
-    if (document.readyState === 'loading') {
-        document.addEventListener('DOMContentLoaded', injectStyle);
-    } else {
-        injectStyle();
-    }
-})();
-"""
+
+def get_ffmpeg_bin() -> str | None:
+    """优先使用系统 ffmpeg，否则使用 imageio-ffmpeg 内置二进制"""
+    system_ffmpeg = shutil.which("ffmpeg")
+    if system_ffmpeg:
+        return system_ffmpeg
+    if imageio_ffmpeg is not None:
+        try:
+            return imageio_ffmpeg.get_ffmpeg_exe()
+        except Exception as e:
+            print(f"[WARN] 获取 imageio-ffmpeg 失败: {e}")
+    return None
 
 
 def parse_hy2_to_singbox_config(hy2_url: str, local_port: int = LOCAL_PROXY_PORT) -> dict:
@@ -237,6 +222,8 @@ def parse_cookies_input(raw: str) -> list[dict]:
             raw_ss = str(item.get("sameSite") or "").lower()
             if raw_ss in same_site_map:
                 c["sameSite"] = same_site_map[raw_ss]
+                if c["sameSite"] == "None":
+                    c["secure"] = True
             exp = item.get("expirationDate") or item.get("expires")
             if isinstance(exp, (int, float)) and exp > 0:
                 c["expires"] = float(exp)
@@ -298,7 +285,7 @@ def save_cookies_from_context(context):
 
 
 def dismiss_cookie_banners(page):
-    """彻底移除 Google CMP / Cookie 遮挡弹窗及遮罩层"""
+    """按需移除 Google CMP / Cookie 遮挡弹窗及遮罩层"""
     try:
         page.evaluate(
             """() => {
@@ -321,6 +308,23 @@ def dismiss_cookie_banners(page):
         pass
 
 
+def human_mouse_click(page, x: float, y: float):
+    """模拟人类鼠标移动轨迹并点击指定坐标"""
+    start_x = max(10.0, x - random.uniform(120, 260))
+    start_y = max(10.0, y - random.uniform(40, 140))
+    page.mouse.move(start_x, start_y, steps=random.randint(6, 12))
+    page.wait_for_timeout(random.randint(120, 260))
+    page.mouse.move(
+        x + random.uniform(-2.0, 2.0),
+        y + random.uniform(-2.0, 2.0),
+        steps=random.randint(14, 24),
+    )
+    page.wait_for_timeout(random.randint(90, 200))
+    page.mouse.down()
+    page.wait_for_timeout(random.randint(60, 140))
+    page.mouse.up()
+
+
 def solve_recaptcha_audio(page, proxy_url: str | None = None, max_attempts: int = 4) -> bool:
     """通过语音验证自动破解 reCAPTCHA v2（支持听不清自动换题与多轮验证）"""
     bframe_selector = 'iframe[src*="recaptcha/api2/bframe"], iframe[title*="recaptcha challenge"]'
@@ -329,8 +333,9 @@ def solve_recaptcha_audio(page, proxy_url: str | None = None, max_attempts: int 
     except PlaywrightTimeoutError:
         return False
 
-    if not shutil.which("ffmpeg"):
-        print("[WARN] 未检测到 ffmpeg，无法执行语音验证")
+    ffmpeg_bin = get_ffmpeg_bin()
+    if not ffmpeg_bin:
+        print("[WARN] 未检测到 ffmpeg（请确认已安装 imageio-ffmpeg），无法执行语音验证")
         return False
 
     print("[INFO] 检测到 reCAPTCHA 挑战弹窗，尝试切换语音验证...")
@@ -342,21 +347,19 @@ def solve_recaptcha_audio(page, proxy_url: str | None = None, max_attempts: int 
     recognizer = sr.Recognizer()
 
     try:
-        # 若还未切到语音模式，先点击耳机图标
         audio_btn = frame.locator("#recaptcha-audio-button")
-        if audio_btn.is_visible(timeout=5000):
+        try:
+            audio_btn.wait_for(state="visible", timeout=5000)
             audio_btn.click()
             page.wait_for_timeout(2500)
+        except PlaywrightTimeoutError:
+            pass
 
         for attempt in range(1, max_attempts + 1):
-            if "/auth/login" not in page.url:
-                return True
-
-            if frame.locator(".rc-doscaptcha-header-text").is_visible(timeout=1200):
+            if frame.locator(".rc-doscaptcha-header-text").is_visible():
                 print("[WARN] 当前代理 IP 被 Google 拒绝语音验证（Try again later），建议配置 FGH_COOKIES 跳过登录")
                 return False
 
-            # 获取音频链接（兼容 audio#audio-source 与下载按钮）
             audio_src = None
             try:
                 audio_src = frame.locator("audio#audio-source").get_attribute("src", timeout=8000)
@@ -373,13 +376,13 @@ def solve_recaptcha_audio(page, proxy_url: str | None = None, max_attempts: int 
                 return False
 
             print(f"[INFO] 语音验证第 {attempt}/{max_attempts} 次尝试...")
-            r = requests.get(audio_src, headers={"User-Agent": USER_AGENT}, proxies=proxies, timeout=20)
+            r = requests.get(audio_src, headers={"User-Agent": REQUESTS_USER_AGENT}, proxies=proxies, timeout=20)
             r.raise_for_status()
             with open(mp3_path, "wb") as f:
                 f.write(r.content)
 
             subprocess.run(
-                ["ffmpeg", "-y", "-i", mp3_path, "-ar", "16000", "-ac", "1", wav_path],
+                [ffmpeg_bin, "-y", "-i", mp3_path, "-ar", "16000", "-ac", "1", wav_path],
                 check=True,
                 stdout=subprocess.DEVNULL,
                 stderr=subprocess.DEVNULL,
@@ -393,11 +396,13 @@ def solve_recaptcha_audio(page, proxy_url: str | None = None, max_attempts: int 
             except sr.UnknownValueError:
                 print(f"[WARN] 第 {attempt}/{max_attempts} 次音频无法识别，刷新换一段新音频...")
                 reload_btn = frame.locator("#recaptcha-reload-button")
-                if reload_btn.is_visible(timeout=3000):
+                try:
+                    reload_btn.wait_for(state="visible", timeout=3000)
                     reload_btn.click()
                     page.wait_for_timeout(2500)
                     continue
-                return False
+                except PlaywrightTimeoutError:
+                    return False
             except sr.RequestError as e:
                 print(f"[WARN] Google 语音识别接口请求失败: {e}")
                 return False
@@ -407,22 +412,20 @@ def solve_recaptcha_audio(page, proxy_url: str | None = None, max_attempts: int 
             response_input.fill(answer)
             page.wait_for_timeout(800)
             frame.locator("#recaptcha-verify-button").click()
-            page.wait_for_timeout(3500)
+            page.wait_for_timeout(3000)
 
-            # 检查是否已经跳转或挑战弹窗已关闭
-            if "/auth/login" not in page.url:
-                return True
             try:
-                if not page.locator(bframe_selector).first.is_visible(timeout=1500):
-                    return True
+                page.locator(bframe_selector).first.wait_for(state="hidden", timeout=2500)
+                return True
+            except PlaywrightTimeoutError:
+                pass
             except Exception:
                 return True
 
-            # 如果弹窗还在，说明需要再来一轮语音验证或刚才答案偏差
             err_tip = ""
             try:
                 err_el = frame.locator(".rc-audiochallenge-error-message")
-                if err_el.is_visible(timeout=1000):
+                if err_el.is_visible():
                     err_tip = err_el.inner_text().strip()
             except Exception:
                 pass
@@ -546,19 +549,135 @@ def extract_timer_text(page) -> str:
     return "未知"
 
 
-def renew_server(page, server_url: str) -> tuple[str, str]:
-    """进入单个服务器页面并尝试续费"""
+def parse_timer_to_seconds(timer_str: str) -> int | None:
+    """将 HH:MM:SS 或 Xh Ym 转换为总秒数，用于精确判断时间是否增加"""
+    if not timer_str or timer_str == "未知":
+        return None
+    m = re.match(r"^(\d+):(\d{2}):(\d{2})$", timer_str.strip())
+    if m:
+        return int(m.group(1)) * 3600 + int(m.group(2)) * 60 + int(m.group(3))
+    h_m = re.search(r"(\d+)\s*h", timer_str, re.I)
+    m_m = re.search(r"(\d+)\s*m", timer_str, re.I)
+    if h_m or m_m:
+        return (int(h_m.group(1)) if h_m else 0) * 3600 + (int(m_m.group(1)) if m_m else 0) * 60
+    return None
+
+
+def is_renewal_completed(page, before_sec: int | None) -> tuple[bool, str, bool]:
+    """检测是否已续期成功（时间明显增加或进入冷却期）"""
+    after_timer = extract_timer_text(page)
+    after_sec = parse_timer_to_seconds(after_timer)
+    in_cooldown = page.locator("text=/RENEWAL\\s*COOLDOWN/i").count() > 0
+    time_increased = before_sec is not None and after_sec is not None and after_sec > before_sec + 60
+    return (in_cooldown or time_increased), after_timer, in_cooldown
+
+
+def solve_turnstile_widget(page, server_id: str, before_sec: int | None, max_attempts: int = 4) -> bool:
+    """定位并点击 Cloudflare Turnstile 复选框完成人机验证"""
+    turnstile_present = (
+        page.locator("text=/Complete security check/i").count() > 0
+        or page.locator('iframe[src*="challenges.cloudflare.com"]').count() > 0
+        or page.locator('input[name="cf-turnstile-response"]').count() > 0
+    )
+    if not turnstile_present:
+        return False
+
+    print(f"[INFO] [{server_id}] 检测到 Cloudflare Turnstile 验证框，等待加载并尝试通过...")
+    page.wait_for_timeout(3000)
+
+    for attempt in range(1, max_attempts + 1):
+        done, _, _ = is_renewal_completed(page, before_sec)
+        if done:
+            print(f"[INFO] [{server_id}] Turnstile 已自动通过并触发续期！")
+            return True
+
+        # 检查是否已生成 Turnstile token
+        try:
+            token_val = page.locator('input[name="cf-turnstile-response"]').first.input_value(timeout=1000)
+            if token_val and len(token_val) > 20:
+                print(f"[INFO] [{server_id}] 已获取到 Turnstile Token，等待后端完成续期...")
+                page.wait_for_timeout(4000)
+                done, _, _ = is_renewal_completed(page, before_sec)
+                if done:
+                    return True
+        except Exception:
+            pass
+
+        # 依次尝试定位 Turnstile 复选框坐标
+        click_xy = None
+
+        # 方式 1：Patchright 穿透 shadow root 直接找 iframe 内复选框
+        try:
+            cf_iframe = page.locator('iframe[src*="challenges.cloudflare.com"]').first
+            if cf_iframe.count() > 0:
+                cf_iframe.scroll_into_view_if_needed(timeout=4000)
+                page.wait_for_timeout(400)
+                cb = page.frame_locator('iframe[src*="challenges.cloudflare.com"]').first.locator('input[type="checkbox"]').first
+                cb_box = cb.bounding_box(timeout=2000)
+                if cb_box and cb_box["width"] > 0:
+                    click_xy = (cb_box["x"] + cb_box["width"] / 2, cb_box["y"] + cb_box["height"] / 2)
+                else:
+                    iframe_box = cf_iframe.bounding_box(timeout=2000)
+                    if iframe_box and iframe_box["width"] > 0:
+                        click_xy = (iframe_box["x"] + 28, iframe_box["y"] + iframe_box["height"] / 2)
+        except Exception:
+            pass
+
+        # 方式 2：通过 Turnstile 容器定位（兼容非标准嵌入）
+        if click_xy is None:
+            for sel in (
+                'div:has(> input[name="cf-turnstile-response"])',
+                '.cf-turnstile',
+                'div:has(> button:has-text("Cancel")) > div:first-child',
+            ):
+                try:
+                    el = page.locator(sel).first
+                    if el.count() > 0:
+                        el.scroll_into_view_if_needed(timeout=3000)
+                        box = el.bounding_box(timeout=2000)
+                        if box and box["width"] >= 100 and box["height"] >= 40:
+                            click_xy = (box["x"] + 28, box["y"] + box["height"] / 2)
+                            break
+                except Exception:
+                    continue
+
+        if click_xy:
+            print(f"[INFO] [{server_id}] Turnstile 第 {attempt}/{max_attempts} 次点击验证框 ({click_xy[0]:.0f}, {click_xy[1]:.0f})...")
+            human_mouse_click(page, click_xy[0], click_xy[1])
+        else:
+            print(f"[WARN] [{server_id}] 第 {attempt}/{max_attempts} 次未找到 Turnstile 坐标，等待渲染...")
+
+        # 点击后轮询 6 秒等待验证与回调完成
+        for _ in range(6):
+            page.wait_for_timeout(1000)
+            done, _, _ = is_renewal_completed(page, before_sec)
+            if done:
+                print(f"[INFO] [{server_id}] Turnstile 验证通过！")
+                return True
+            if page.locator("text=/Complete security check/i").count() == 0:
+                page.wait_for_timeout(2000)
+                return True
+
+    print(f"[WARN] [{server_id}] Turnstile 多次点击后仍未通过（可能代理 IP 风控较高）")
+    return False
+
+
+def renew_server(page, server_url: str, proxy_url: str | None = None) -> tuple[str, str]:
+    """进入单个服务器页面并尝试续费（含 Turnstile / 弹窗处理与接口抓包校验）"""
     server_id = server_url.rstrip("/").split("/")[-1]
     print(f"[INFO] 正在检查服务器: {server_url}")
     page.goto(server_url, wait_until="domcontentloaded", timeout=60000)
     page.wait_for_timeout(5000)
     dismiss_cookie_banners(page)
 
+    # 模拟自然鼠标移动与滚动，为 Turnstile 提供正常交互信号
+    page.mouse.move(random.randint(300, 600), random.randint(200, 400), steps=10)
     page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
     page.wait_for_timeout(2000)
     dismiss_cookie_banners(page)
 
     before_timer = extract_timer_text(page)
+    before_sec = parse_timer_to_seconds(before_timer)
     print(f"[INFO] [{server_id}] 当前剩余时间: {before_timer}")
 
     extend_card = page.locator("text=EXTEND SERVER").first
@@ -591,46 +710,112 @@ def renew_server(page, server_url: str) -> tuple[str, str]:
         page.locator("button:has-text('Renew'), [role='button']:has-text('Renew')"),
     ]
 
-    clicked = False
-    for group in btn_candidates:
-        count = group.count()
-        for i in range(count):
-            btn = group.nth(i)
-            try:
-                if btn.is_visible() and btn.is_enabled():
-                    text = " ".join(btn.inner_text().split())
-                    if re.search(r"upgrade|premium", text, re.I):
-                        continue
-                    print(f"[INFO] [{server_id}] 找到续费按钮: '{text}'，准备点击...")
-                    dismiss_cookie_banners(page)
-                    btn.scroll_into_view_if_needed()
-                    try:
-                        btn.click(timeout=6000)
-                    except Exception as click_err:
-                        print(f"[WARN] 常规点击被拦截，清理遮罩后强制点击: {click_err}")
-                        dismiss_cookie_banners(page)
-                        btn.click(force=True, timeout=6000)
-                    clicked = True
-                    break
-            except Exception as e:
-                print(f"[WARN] 按钮尝试点击异常: {e}")
-        if clicked:
-            break
+    api_logs: list[str] = []
 
-    if not clicked:
-        shot = os.path.join(SCREENSHOT_DIR, f"{server_id}_no_button.png")
+    def on_response(resp):
+        try:
+            req = resp.request
+            url_lower = resp.url.lower()
+            if "google-analytics.com" in url_lower:
+                return
+            if req.method in ("POST", "PUT", "PATCH") or any(
+                k in url_lower for k in ("renew", "extend", "timer")
+            ):
+                body = ""
+                try:
+                    body = resp.text()[:200].replace("\n", " ")
+                except Exception:
+                    pass
+                api_logs.append(f"{req.method} {resp.status} {resp.url} -> {body}")
+        except Exception:
+            pass
+
+    page.on("response", on_response)
+    clicked = False
+    try:
+        for group in btn_candidates:
+            count = group.count()
+            for i in range(count):
+                btn = group.nth(i)
+                try:
+                    if btn.is_visible() and btn.is_enabled():
+                        text = " ".join(btn.inner_text().split())
+                        if re.search(r"upgrade|premium", text, re.I):
+                            continue
+                        print(f"[INFO] [{server_id}] 找到续费按钮: '{text}'，准备点击...")
+                        dismiss_cookie_banners(page)
+                        btn.scroll_into_view_if_needed()
+                        box = btn.bounding_box()
+                        if box and box["width"] > 0:
+                            human_mouse_click(page, box["x"] + box["width"] / 2, box["y"] + box["height"] / 2)
+                        else:
+                            btn.click(timeout=6000)
+                        clicked = True
+                        break
+                except Exception as e:
+                    print(f"[WARN] 按钮尝试点击异常: {e}")
+            if clicked:
+                break
+
+        if not clicked:
+            shot = os.path.join(SCREENSHOT_DIR, f"{server_id}_no_button.png")
+            page.screenshot(path=shot, full_page=True)
+            msg = f"⚠️ [{server_id}] 未找到可用的续费按钮，当前剩余: {before_timer}"
+            print(f"[WARN] {msg}")
+            return msg, shot
+
+        page.wait_for_timeout(2500)
+
+        # 处理 Cloudflare Turnstile 验证框
+        solve_turnstile_widget(page, server_id, before_sec)
+
+        # 检查是否弹出二次确认弹窗
+        modal_confirm = page.locator(
+            "[role='dialog'] button:has-text('Confirm'), "
+            "[role='dialog'] button:has-text('Extend'), "
+            "[role='dialog'] button:has-text('Continue'), "
+            "[role='dialog'] button:has-text('Yes')"
+        ).first
+        if modal_confirm.count() > 0 and modal_confirm.is_visible():
+            print("[INFO] 检测到二次确认弹窗，自动点击确认...")
+            modal_confirm.click(force=True, timeout=5000)
+            page.wait_for_timeout(2500)
+
+        # 检查是否触发 reCAPTCHA
+        bframe = page.locator('iframe[src*="recaptcha/api2/bframe"], iframe[title*="recaptcha challenge"]').first
+        if bframe.count() > 0 and bframe.is_visible():
+            print("[INFO] 点击续费后触发 reCAPTCHA，尝试语音验证...")
+            solve_recaptcha_audio(page, proxy_url)
+
+        # 最终轮询确认剩余时间是否更新
+        completed = False
+        after_timer = before_timer
+        in_cooldown = False
+        for _ in range(8):
+            dismiss_cookie_banners(page)
+            completed, after_timer, in_cooldown = is_renewal_completed(page, before_sec)
+            if completed:
+                break
+            page.wait_for_timeout(1000)
+    finally:
+        page.remove_listener("response", on_response)
+
+    if api_logs:
+        print(f"[DEBUG] [{server_id}] 点击后捕获到的接口请求:")
+        for line in api_logs[-6:]:
+            print(f"  - {line}")
+    else:
+        print(f"[WARN] [{server_id}] 点击按钮后未捕获到任何续期接口请求")
+
+    if not completed:
+        shot = os.path.join(SCREENSHOT_DIR, f"{server_id}_failed.png")
         page.screenshot(path=shot, full_page=True)
-        msg = f"⚠️ [{server_id}] 未找到可用的续费按钮（可能未到可续期时间或页面结构变化），当前剩余: {before_timer}"
-        print(f"[WARN] {msg}")
+        msg = f"❌ [{server_id}] 续费未生效！剩余时间: {before_timer} -> {after_timer}（请查看日志接口返回与截图）"
+        print(f"[ERROR] {msg}")
         return msg, shot
 
-    page.wait_for_timeout(5000)
-    dismiss_cookie_banners(page)
-    after_timer = extract_timer_text(page)
-    in_cooldown = page.locator("text=/RENEWAL\\s*COOLDOWN/i").count() > 0
     shot = os.path.join(SCREENSHOT_DIR, f"{server_id}_renewed.png")
     page.screenshot(path=shot, full_page=False)
-
     status_note = "（已进入冷却期）" if in_cooldown else ""
     msg = f"✅ [{server_id}] 续费成功！剩余时间: {before_timer} -> {after_timer}{status_note}"
     print(f"[INFO] {msg}")
@@ -644,41 +829,46 @@ def main():
 
     singbox_proc = None
     temp_files: list[str] = []
+    profile_dir = tempfile.mkdtemp(prefix="fgh_chrome_profile_")
     effective_proxy = PROXY_URL
 
     try:
         if PROXY_URL.lower().startswith(("hy2://", "hysteria2://")):
             effective_proxy, singbox_proc, temp_files = start_hy2_bridge(PROXY_URL)
 
+        use_system_chrome = bool(shutil.which("google-chrome") or shutil.which("google-chrome-stable"))
+        has_display = bool(os.getenv("DISPLAY"))
+
         launch_kwargs = {
-            "headless": True,
+            "user_data_dir": profile_dir,
+            "headless": not has_display,
+            "no_viewport": True,
             "args": [
                 "--no-sandbox",
-                "--disable-blink-features=AutomationControlled",
                 "--disable-dev-shm-usage",
+                "--window-size=1366,900",
             ],
         }
+        if use_system_chrome:
+            launch_kwargs["channel"] = "chrome"
         if effective_proxy:
             launch_kwargs["proxy"] = {"server": effective_proxy}
             print("[INFO] 浏览器已启用代理")
+
+        print(f"[INFO] 启动浏览器模式: channel={'chrome' if use_system_chrome else 'chromium'}, headless={launch_kwargs['headless']}")
 
         results = []
         last_shot = None
 
         with sync_playwright() as p:
-            browser = p.chromium.launch(**launch_kwargs)
-            context = browser.new_context(
-                viewport={"width": 1280, "height": 900},
-                user_agent=USER_AGENT,
-            )
-            context.add_init_script(BLOCK_CMP_INIT_SCRIPT)
-            page = context.new_page()
+            context = p.chromium.launch_persistent_context(**launch_kwargs)
+            page = context.pages[0] if context.pages else context.new_page()
 
             try:
                 ensure_logged_in(page, context, effective_proxy or None)
                 server_urls = discover_server_urls(page)
                 for url in server_urls:
-                    msg, shot = renew_server(page, url)
+                    msg, shot = renew_server(page, url, effective_proxy or None)
                     results.append(msg)
                     last_shot = shot
                 save_cookies_from_context(context)
@@ -692,15 +882,18 @@ def main():
                 except Exception:
                     pass
                 send_telegram(err_msg, last_shot)
-                browser.close()
+                context.close()
                 sys.exit(1)
 
-            browser.close()
+            context.close()
 
         summary = "<b>FreeGameHost 自动保活报告</b>\n" + "\n".join(html.escape(r) for r in results)
         print("\n" + "\n".join(results))
-        if any("✅" in r or "⚠️" in r for r in results) or os.getenv("TG_ALWAYS_NOTIFY") == "1":
+        if any(flag in r for r in results for flag in ("✅", "⚠️", "❌")) or os.getenv("TG_ALWAYS_NOTIFY") == "1":
             send_telegram(summary, last_shot)
+
+        if any("❌" in r for r in results):
+            sys.exit(1)
 
     finally:
         if singbox_proc and singbox_proc.poll() is None:
@@ -715,6 +908,7 @@ def main():
                     os.remove(fpath)
                 except OSError:
                     pass
+        shutil.rmtree(profile_dir, ignore_errors=True)
 
 
 if __name__ == "__main__":
