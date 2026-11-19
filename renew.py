@@ -321,8 +321,8 @@ def dismiss_cookie_banners(page):
         pass
 
 
-def solve_recaptcha_audio(page, proxy_url: str | None = None) -> bool:
-    """尝试通过语音验证自动破解 reCAPTCHA v2 弹窗"""
+def solve_recaptcha_audio(page, proxy_url: str | None = None, max_attempts: int = 4) -> bool:
+    """通过语音验证自动破解 reCAPTCHA v2（支持听不清自动换题与多轮验证）"""
     bframe_selector = 'iframe[src*="recaptcha/api2/bframe"], iframe[title*="recaptcha challenge"]'
     try:
         page.wait_for_selector(bframe_selector, state="visible", timeout=8000)
@@ -338,48 +338,99 @@ def solve_recaptcha_audio(page, proxy_url: str | None = None) -> bool:
 
     mp3_path = os.path.join(tempfile.gettempdir(), "recaptcha_audio.mp3")
     wav_path = os.path.join(tempfile.gettempdir(), "recaptcha_audio.wav")
+    proxies = {"http": proxy_url, "https": proxy_url} if proxy_url else None
+    recognizer = sr.Recognizer()
 
     try:
+        # 若还未切到语音模式，先点击耳机图标
         audio_btn = frame.locator("#recaptcha-audio-button")
-        audio_btn.wait_for(state="visible", timeout=8000)
-        audio_btn.click()
-        page.wait_for_timeout(2500)
+        if audio_btn.is_visible(timeout=5000):
+            audio_btn.click()
+            page.wait_for_timeout(2500)
 
-        if frame.locator(".rc-doscaptcha-header-text").is_visible(timeout=1500):
-            print("[WARN] 当前代理 IP 被 Google 拒绝语音验证（Try again later），建议配置 FGH_COOKIES 跳过登录")
-            return False
+        for attempt in range(1, max_attempts + 1):
+            if "/auth/login" not in page.url:
+                return True
 
-        audio_src = frame.locator("audio#audio-source").get_attribute("src", timeout=10000)
-        if not audio_src:
-            print("[WARN] 未获取到语音验证音频链接")
-            return False
+            if frame.locator(".rc-doscaptcha-header-text").is_visible(timeout=1200):
+                print("[WARN] 当前代理 IP 被 Google 拒绝语音验证（Try again later），建议配置 FGH_COOKIES 跳过登录")
+                return False
 
-        proxies = {"http": proxy_url, "https": proxy_url} if proxy_url else None
-        r = requests.get(audio_src, headers={"User-Agent": USER_AGENT}, proxies=proxies, timeout=20)
-        r.raise_for_status()
-        with open(mp3_path, "wb") as f:
-            f.write(r.content)
+            # 获取音频链接（兼容 audio#audio-source 与下载按钮）
+            audio_src = None
+            try:
+                audio_src = frame.locator("audio#audio-source").get_attribute("src", timeout=8000)
+            except Exception:
+                pass
+            if not audio_src:
+                try:
+                    audio_src = frame.locator("a.rc-audiochallenge-tdownload-link").get_attribute("href", timeout=5000)
+                except Exception:
+                    pass
 
-        subprocess.run(
-            ["ffmpeg", "-y", "-i", mp3_path, "-ar", "16000", "-ac", "1", wav_path],
-            check=True,
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-        )
+            if not audio_src:
+                print(f"[WARN] 第 {attempt}/{max_attempts} 次未获取到音频链接")
+                return False
 
-        recognizer = sr.Recognizer()
-        with sr.AudioFile(wav_path) as source:
-            audio_data = recognizer.record(source)
-        answer = recognizer.recognize_google(audio_data, language="en-US")
-        print(f"[INFO] 语音识别结果: {answer}")
+            print(f"[INFO] 语音验证第 {attempt}/{max_attempts} 次尝试...")
+            r = requests.get(audio_src, headers={"User-Agent": USER_AGENT}, proxies=proxies, timeout=20)
+            r.raise_for_status()
+            with open(mp3_path, "wb") as f:
+                f.write(r.content)
 
-        frame.locator("#audio-response").fill(answer)
-        page.wait_for_timeout(800)
-        frame.locator("#recaptcha-verify-button").click()
-        page.wait_for_timeout(3000)
-        return True
+            subprocess.run(
+                ["ffmpeg", "-y", "-i", mp3_path, "-ar", "16000", "-ac", "1", wav_path],
+                check=True,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
+
+            try:
+                with sr.AudioFile(wav_path) as source:
+                    audio_data = recognizer.record(source)
+                answer = recognizer.recognize_google(audio_data, language="en-US")
+                print(f"[INFO] 语音识别结果: {answer}")
+            except sr.UnknownValueError:
+                print(f"[WARN] 第 {attempt}/{max_attempts} 次音频无法识别，刷新换一段新音频...")
+                reload_btn = frame.locator("#recaptcha-reload-button")
+                if reload_btn.is_visible(timeout=3000):
+                    reload_btn.click()
+                    page.wait_for_timeout(2500)
+                    continue
+                return False
+            except sr.RequestError as e:
+                print(f"[WARN] Google 语音识别接口请求失败: {e}")
+                return False
+
+            response_input = frame.locator("#audio-response")
+            response_input.fill("")
+            response_input.fill(answer)
+            page.wait_for_timeout(800)
+            frame.locator("#recaptcha-verify-button").click()
+            page.wait_for_timeout(3500)
+
+            # 检查是否已经跳转或挑战弹窗已关闭
+            if "/auth/login" not in page.url:
+                return True
+            try:
+                if not page.locator(bframe_selector).first.is_visible(timeout=1500):
+                    return True
+            except Exception:
+                return True
+
+            # 如果弹窗还在，说明需要再来一轮语音验证或刚才答案偏差
+            err_tip = ""
+            try:
+                err_el = frame.locator(".rc-audiochallenge-error-message")
+                if err_el.is_visible(timeout=1000):
+                    err_tip = err_el.inner_text().strip()
+            except Exception:
+                pass
+            print(f"[INFO] 验证未结束（{err_tip or '需要下一轮验证'}），继续尝试...")
+
+        return False
     except Exception as e:
-        print(f"[WARN] reCAPTCHA 语音识别失败: {e}")
+        print(f"[WARN] reCAPTCHA 语音识别异常: {type(e).__name__}: {e}")
         return False
     finally:
         for tmp_f in (mp3_path, wav_path):
