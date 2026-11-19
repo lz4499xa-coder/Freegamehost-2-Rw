@@ -10,12 +10,14 @@ import time
 from urllib.parse import parse_qs, unquote, urlparse
 
 import requests
+import speech_recognition as sr
 from playwright.sync_api import TimeoutError as PlaywrightTimeoutError
 from playwright.sync_api import sync_playwright
 
 PANEL_URL = os.getenv("FGH_PANEL_URL", "https://panel.freegamehost.xyz").rstrip("/")
 USERNAME = os.getenv("FGH_USERNAME", "").strip()
 PASSWORD = os.getenv("FGH_PASSWORD", "").strip()
+FGH_COOKIES = os.getenv("FGH_COOKIES", "").strip()
 SERVER_IDS = [s.strip() for s in os.getenv("FGH_SERVER_IDS", "").split(",") if s.strip()]
 PROXY_URL = os.getenv("PROXY_URL", "").strip()
 TG_BOT_TOKEN = os.getenv("TG_BOT_TOKEN", "").strip()
@@ -23,7 +25,10 @@ TG_CHAT_ID = os.getenv("TG_CHAT_ID", "").strip()
 
 LOCAL_PROXY_PORT = 10808
 SCREENSHOT_DIR = "screenshots"
+STATE_DIR = "state"
+COOKIE_FILE = os.path.join(STATE_DIR, "cookies.json")
 os.makedirs(SCREENSHOT_DIR, exist_ok=True)
+os.makedirs(STATE_DIR, exist_ok=True)
 
 
 def parse_hy2_to_singbox_config(hy2_url: str, local_port: int = LOCAL_PROXY_PORT) -> dict:
@@ -34,7 +39,6 @@ def parse_hy2_to_singbox_config(hy2_url: str, local_port: int = LOCAL_PROXY_PORT
         raise ValueError("hy2 链接缺少服务器地址")
     port = parsed.port or 443
 
-    # Hysteria2 规范中 user:pass 整体作为密码
     if parsed.username and parsed.password:
         password = f"{unquote(parsed.username)}:{unquote(parsed.password)}"
     elif parsed.username:
@@ -85,7 +89,7 @@ def start_hy2_bridge(hy2_url: str) -> tuple[str, subprocess.Popen, str]:
     """启动 sing-box 将 hy2 转为本地 HTTP/SOCKS5 代理"""
     singbox_bin = shutil.which("sing-box")
     if not singbox_bin:
-        raise RuntimeError("未找到 sing-box，请先安装 sing-box 或检查 workflow 配置")
+        raise RuntimeError("未找到 sing-box，请检查 workflow 配置")
 
     config = parse_hy2_to_singbox_config(hy2_url, LOCAL_PROXY_PORT)
     fd, config_path = tempfile.mkstemp(prefix="singbox_hy2_", suffix=".json")
@@ -99,7 +103,6 @@ def start_hy2_bridge(hy2_url: str) -> tuple[str, subprocess.Popen, str]:
         text=True,
     )
 
-    # 等待本地端口就绪
     ready = False
     for _ in range(30):
         if proc.poll() is not None:
@@ -119,7 +122,6 @@ def start_hy2_bridge(hy2_url: str) -> tuple[str, subprocess.Popen, str]:
     local_proxy = f"http://127.0.0.1:{LOCAL_PROXY_PORT}"
     print(f"[INFO] hy2 代理已桥接至 {local_proxy}")
 
-    # 验证代理出口连通性
     try:
         resp = requests.get(
             "https://api.ipify.org?format=json",
@@ -128,7 +130,7 @@ def start_hy2_bridge(hy2_url: str) -> tuple[str, subprocess.Popen, str]:
         )
         print(f"[INFO] hy2 代理连通成功，当前出口 IP: {resp.json().get('ip')}")
     except Exception as e:
-        print(f"[WARN] 出口 IP 检测失败（仍将继续尝试访问面板）: {e}")
+        print(f"[WARN] 出口 IP 检测失败（仍将继续尝试）: {e}")
 
     return local_proxy, proc, config_path
 
@@ -158,6 +160,89 @@ def send_telegram(message: str, image_path: str | None = None):
         print(f"[WARN] Telegram 推送失败: {e}")
 
 
+def parse_cookies_input(raw: str) -> list[dict]:
+    """兼容 JSON 数组（Cookie-Editor 导出）和普通 Cookie 请求头字符串"""
+    raw = raw.strip()
+    if not raw:
+        return []
+    host = urlparse(PANEL_URL).hostname
+    cookies = []
+
+    if raw.startswith("["):
+        data = json.loads(raw)
+        for item in data:
+            c = {
+                "name": item["name"],
+                "value": item["value"],
+                "domain": item.get("domain", host),
+                "path": item.get("path", "/"),
+                "secure": bool(item.get("secure", True)),
+                "httpOnly": bool(item.get("httpOnly", False)),
+            }
+            same_site = str(item.get("sameSite", "Lax")).capitalize()
+            if same_site in ("Strict", "Lax", "None"):
+                c["sameSite"] = same_site
+            if "expirationDate" in item and item["expirationDate"]:
+                c["expires"] = float(item["expirationDate"])
+            elif "expires" in item and item["expires"]:
+                c["expires"] = float(item["expires"])
+            cookies.append(c)
+    else:
+        for pair in raw.split(";"):
+            if "=" not in pair:
+                continue
+            k, v = pair.split("=", 1)
+            k = k.strip()
+            if k:
+                cookies.append(
+                    {
+                        "name": k,
+                        "value": v.strip(),
+                        "domain": host,
+                        "path": "/",
+                        "secure": True,
+                    }
+                )
+    return cookies
+
+
+def load_cookies_to_context(context) -> bool:
+    """优先加载缓存中的最新 Cookie，其次加载 Secret 中的 FGH_COOKIES"""
+    cookies = []
+    if os.path.exists(COOKIE_FILE):
+        try:
+            with open(COOKIE_FILE, "r", encoding="utf-8") as f:
+                cookies = json.load(f)
+            if cookies:
+                print(f"[INFO] 已从缓存加载 {len(cookies)} 条 Cookie")
+        except Exception as e:
+            print(f"[WARN] 读取缓存 Cookie 失败: {e}")
+
+    if not cookies and FGH_COOKIES:
+        try:
+            cookies = parse_cookies_input(FGH_COOKIES)
+            if cookies:
+                print(f"[INFO] 已从 FGH_COOKIES 加载 {len(cookies)} 条 Cookie")
+        except Exception as e:
+            print(f"[WARN] 解析 FGH_COOKIES 失败: {e}")
+
+    if cookies:
+        context.add_cookies(cookies)
+        return True
+    return False
+
+
+def save_cookies_from_context(context):
+    """保存刷新后的 Cookie 供下次复用"""
+    try:
+        cookies = context.cookies()
+        with open(COOKIE_FILE, "w", encoding="utf-8") as f:
+            json.dump(cookies, f, ensure_ascii=False, indent=2)
+        print(f"[INFO] 已保存最新 {len(cookies)} 条 Cookie 至 {COOKIE_FILE}")
+    except Exception as e:
+        print(f"[WARN] 保存 Cookie 失败: {e}")
+
+
 def dismiss_cookie_banners(page):
     """关闭或隐藏 Google CMP / Cookie 遮挡弹窗"""
     selectors = [
@@ -172,9 +257,9 @@ def dismiss_cookie_banners(page):
     for sel in selectors:
         try:
             loc = page.locator(sel).first
-            if loc.is_visible(timeout=1500):
+            if loc.is_visible(timeout=1200):
                 loc.click(timeout=2000)
-                time.sleep(0.5)
+                time.sleep(0.4)
         except Exception:
             pass
 
@@ -190,8 +275,91 @@ def dismiss_cookie_banners(page):
         pass
 
 
-def login(page):
-    """登录 Pterodactyl 面板"""
+def solve_recaptcha_audio(page, proxy_url: str | None = None) -> bool:
+    """尝试通过语音验证自动破解 reCAPTCHA v2 弹窗"""
+    bframe_selector = 'iframe[src*="recaptcha/api2/bframe"], iframe[title*="recaptcha challenge"]'
+    try:
+        page.wait_for_selector(bframe_selector, state="visible", timeout=8000)
+    except PlaywrightTimeoutError:
+        return False
+
+    print("[INFO] 检测到 reCAPTCHA 挑战弹窗，尝试切换语音验证...")
+    frame = page.frame_locator(bframe_selector).first
+
+    try:
+        audio_btn = frame.locator("#recaptcha-audio-button")
+        audio_btn.wait_for(state="visible", timeout=8000)
+        audio_btn.click()
+        page.wait_for_timeout(2500)
+
+        # 检查是否被 Google 拒绝语音验证
+        if frame.locator(".rc-doscaptcha-header-text").is_visible(timeout=1500):
+            print("[WARN] 当前代理 IP 被 Google 拒绝语音验证（Try again later），建议配置 FGH_COOKIES 跳过登录")
+            return False
+
+        audio_src = frame.locator("audio#audio-source").get_attribute("src", timeout=10000)
+        if not audio_src:
+            print("[WARN] 未获取到语音验证音频链接")
+            return False
+
+        proxies = {"http": proxy_url, "https": proxy_url} if proxy_url else None
+        mp3_path = os.path.join(tempfile.gettempdir(), "recaptcha_audio.mp3")
+        wav_path = os.path.join(tempfile.gettempdir(), "recaptcha_audio.wav")
+
+        r = requests.get(audio_src, proxies=proxies, timeout=20)
+        r.raise_for_status()
+        with open(mp3_path, "wb") as f:
+            f.write(r.content)
+
+        subprocess.run(
+            ["ffmpeg", "-y", "-i", mp3_path, "-ar", "16000", "-ac", "1", wav_path],
+            check=True,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+
+        recognizer = sr.Recognizer()
+        with sr.AudioFile(wav_path) as source:
+            audio_data = recognizer.record(source)
+        answer = recognizer.recognize_google(audio_data, language="en-US")
+        print(f"[INFO] 语音识别结果: {answer}")
+
+        frame.locator("#audio-response").fill(answer)
+        page.wait_for_timeout(800)
+        frame.locator("#recaptcha-verify-button").click()
+        page.wait_for_timeout(3000)
+        return True
+    except Exception as e:
+        print(f"[WARN] reCAPTCHA 语音识别失败: {e}")
+        return False
+
+
+def ensure_logged_in(page, context, proxy_url: str | None = None):
+    """优先验证 Cookie 是否已登录，失效则降级为账密 + 语音验证登录"""
+    has_cookie = load_cookies_to_context(context)
+    if has_cookie:
+        print(f"[INFO] 尝试使用 Cookie 直接访问仪表盘: {PANEL_URL}")
+        page.goto(PANEL_URL, wait_until="domcontentloaded", timeout=60000)
+        page.wait_for_timeout(4000)
+        if "/auth/login" not in page.url:
+            print(f"[INFO] Cookie 有效，已免验证码登录！当前页面: {page.url}")
+            return
+        print("[WARN] Cookie 已过期，准备回退到账密登录...")
+        # 若缓存 Cookie 过期但 Secret 里有新 Cookie，再尝试一次 Secret
+        if os.path.exists(COOKIE_FILE) and FGH_COOKIES:
+            context.clear_cookies()
+            secret_cookies = parse_cookies_input(FGH_COOKIES)
+            if secret_cookies:
+                context.add_cookies(secret_cookies)
+                page.goto(PANEL_URL, wait_until="domcontentloaded", timeout=60000)
+                page.wait_for_timeout(4000)
+                if "/auth/login" not in page.url:
+                    print(f"[INFO] Secret 中的 FGH_COOKIES 有效，已免验证码登录！")
+                    return
+
+    if not USERNAME or not PASSWORD:
+        raise RuntimeError("Cookie 不可用且未配置 FGH_USERNAME / FGH_PASSWORD")
+
     print(f"[INFO] 打开登录页: {PANEL_URL}/auth/login")
     page.goto(f"{PANEL_URL}/auth/login", wait_until="domcontentloaded", timeout=60000)
     page.wait_for_timeout(3000)
@@ -209,18 +377,26 @@ def login(page):
     submit_btn = page.locator('button[type="submit"], button:has-text("SIGN IN"), button:has-text("Sign In")').first
     submit_btn.click()
 
-    try:
-        page.wait_for_function(
-            "() => !window.location.pathname.includes('/auth/login')",
-            timeout=30000,
-        )
-    except PlaywrightTimeoutError:
-        err_shot = os.path.join(SCREENSHOT_DIR, "login_failed.png")
-        page.screenshot(path=err_shot, full_page=True)
-        raise RuntimeError(f"登录超时或触发验证码/账密错误，当前 URL: {page.url}")
+    # 等待跳转或处理 reCAPTCHA 弹窗
+    for attempt in range(2):
+        try:
+            page.wait_for_function(
+                "() => !window.location.pathname.includes('/auth/login')",
+                timeout=10000,
+            )
+            page.wait_for_timeout(3000)
+            print(f"[INFO] 登录成功，当前页面: {page.url}")
+            return
+        except PlaywrightTimeoutError:
+            if attempt == 0 and solve_recaptcha_audio(page, proxy_url):
+                continue
+            break
 
-    page.wait_for_timeout(3000)
-    print(f"[INFO] 登录成功，当前页面: {page.url}")
+    err_shot = os.path.join(SCREENSHOT_DIR, "login_failed.png")
+    page.screenshot(path=err_shot, full_page=True)
+    raise RuntimeError(
+        f"登录被 reCAPTCHA 拦截或账密错误，当前 URL: {page.url}（建议配置 FGH_COOKIES 免验证码登录）"
+    )
 
 
 def discover_server_urls(page) -> list[str]:
@@ -231,8 +407,9 @@ def discover_server_urls(page) -> list[str]:
             for sid in SERVER_IDS
         ]
 
-    page.goto(PANEL_URL, wait_until="domcontentloaded", timeout=60000)
-    page.wait_for_timeout(4000)
+    if page.url.rstrip("/") != PANEL_URL:
+        page.goto(PANEL_URL, wait_until="domcontentloaded", timeout=60000)
+        page.wait_for_timeout(4000)
     dismiss_cookie_banners(page)
 
     hrefs = page.evaluate(
@@ -347,8 +524,8 @@ def renew_server(page, server_url: str) -> tuple[str, str]:
 
 
 def main():
-    if not USERNAME or not PASSWORD:
-        print("[ERROR] 缺少环境变量 FGH_USERNAME 或 FGH_PASSWORD")
+    if not FGH_COOKIES and (not USERNAME or not PASSWORD):
+        print("[ERROR] 请至少配置 FGH_COOKIES 或 FGH_USERNAME + FGH_PASSWORD")
         sys.exit(1)
 
     singbox_proc = None
@@ -390,12 +567,14 @@ def main():
             page = context.new_page()
 
             try:
-                login(page)
+                ensure_logged_in(page, context, effective_proxy or None)
                 server_urls = discover_server_urls(page)
                 for url in server_urls:
                     msg, shot = renew_server(page, url)
                     results.append(msg)
                     last_shot = shot
+                # 全部完成后保存刷新后的 Cookie，供下次保活复用
+                save_cookies_from_context(context)
             except Exception as e:
                 err_msg = f"❌ FreeGameHost 自动续费异常:\n{e}"
                 print(f"[ERROR] {err_msg}")
