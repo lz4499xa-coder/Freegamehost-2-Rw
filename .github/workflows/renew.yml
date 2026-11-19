@@ -2,7 +2,7 @@ name: FreeGameHost Auto Renew
 
 on:
   schedule:
-    # 每 2 小时执行一次（若想更稳改为每 1 小时，写成 "20 * * * *"）
+    # 每 2 小时执行一次（8 小时有效期 + 2 小时冷却）
     - cron: "15 */2 * * *"
   workflow_dispatch:
 
@@ -35,6 +35,21 @@ jobs:
             playwright install chromium
           fi
           playwright install-deps chromium
+
+      - name: Install sing-box (if using hy2 proxy)
+        env:
+          PROXY_URL: ${{ secrets.PROXY_URL }}
+        run: |
+          if [[ "${PROXY_URL,,}" == hy2://* || "${PROXY_URL,,}" == hysteria2://* ]]; then
+            echo "检测到 hy2 代理，正在安装 sing-box..."
+            SB_TAG=$(curl -fsSL -o /dev/null -w '%{url_effective}' https://github.com/SagerNet/sing-box/releases/latest | awk -F'/tag/' '{print $2}')
+            SB_VER="${SB_TAG#v}"
+            curl -fsSL "https://github.com/SagerNet/sing-box/releases/download/${SB_TAG}/sing-box-${SB_VER}-linux-amd64.tar.gz" -o /tmp/sing-box.tar.gz
+            tar -xzf /tmp/sing-box.tar.gz -C /tmp
+            sudo mv "/tmp/sing-box-${SB_VER}-linux-amd64/sing-box" /usr/local/bin/sing-box
+            sudo chmod +x /usr/local/bin/sing-box
+            sing-box version
+          fi
 
       - name: Run FreeGameHost Auto Renew
         env:
