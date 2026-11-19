@@ -36,6 +36,40 @@ COOKIE_FILE = os.path.join(STATE_DIR, "cookies.json")
 os.makedirs(SCREENSHOT_DIR, exist_ok=True)
 os.makedirs(STATE_DIR, exist_ok=True)
 
+# 持久拦截 Google CMP / Funding Choices 遮罩层
+BLOCK_CMP_INIT_SCRIPT = """
+Object.defineProperty(navigator, 'webdriver', {get: () => undefined});
+(() => {
+    const injectStyle = () => {
+        if (document.getElementById('fgh-anti-cmp-style')) return;
+        const style = document.createElement('style');
+        style.id = 'fgh-anti-cmp-style';
+        style.textContent = `
+            .fc-consent-root,
+            .fc-dialog-overlay,
+            .fc-dialog-container,
+            .fc-monetization-dialog-container,
+            [id*="sp_message_container"] {
+                display: none !important;
+                visibility: hidden !important;
+                pointer-events: none !important;
+                z-index: -9999 !important;
+            }
+            body, html {
+                overflow: auto !important;
+                pointer-events: auto !important;
+            }
+        `;
+        (document.head || document.documentElement).appendChild(style);
+    };
+    if (document.readyState === 'loading') {
+        document.addEventListener('DOMContentLoaded', injectStyle);
+    } else {
+        injectStyle();
+    }
+})();
+"""
+
 
 def parse_hy2_to_singbox_config(hy2_url: str, local_port: int = LOCAL_PROXY_PORT) -> dict:
     """解析 hy2:// 或 hysteria2:// 链接并生成 sing-box 配置"""
@@ -264,31 +298,23 @@ def save_cookies_from_context(context):
 
 
 def dismiss_cookie_banners(page):
-    """关闭或隐藏 Google CMP / Cookie 遮挡弹窗"""
-    selectors = [
-        "button:has-text('Consent')",
-        "button:has-text('Accept')",
-        "button:has-text('Agree')",
-        "button:has-text('同意')",
-        "button[aria-label='Close']",
-        ".fc-cta-consent",
-        ".fc-close",
-    ]
-    for sel in selectors:
-        try:
-            loc = page.locator(sel).first
-            if loc.is_visible(timeout=1200):
-                loc.click(timeout=2000)
-                time.sleep(0.4)
-        except Exception:
-            pass
-
+    """彻底移除 Google CMP / Cookie 遮挡弹窗及遮罩层"""
     try:
         page.evaluate(
             """() => {
-                document.querySelectorAll('.fc-consent-root, [id*="sp_message"], [class*="cookie"], iframe[title*="Consent"]').forEach(el => {
-                    el.style.display = 'none';
-                });
+                const selectors = [
+                    '.fc-consent-root',
+                    '.fc-dialog-overlay',
+                    '.fc-dialog-container',
+                    '.fc-monetization-dialog-container',
+                    '[id*="sp_message"]',
+                    'iframe[title*="Consent"]'
+                ];
+                document.querySelectorAll(selectors.join(',')).forEach(el => el.remove());
+                if (document.body) {
+                    document.body.style.overflow = 'auto';
+                    document.body.style.pointerEvents = 'auto';
+                }
             }"""
         )
     except Exception:
@@ -508,11 +534,10 @@ def renew_server(page, server_url: str) -> tuple[str, str]:
         return msg, shot
 
     btn_candidates = [
+        page.locator("button:has-text('EXTEND FREE SERVER')"),
+        page.locator("button[class*='RenewBtn']"),
         page.locator("button:has-text('Extend'), [role='button']:has-text('Extend')"),
-        page.locator("button:has-text('EXTEND'), [role='button']:has-text('EXTEND')"),
         page.locator("button:has-text('Renew'), [role='button']:has-text('Renew')"),
-        page.locator("button:has-text('RENEW'), [role='button']:has-text('RENEW')"),
-        page.locator("button:has-text('Add Time'), [role='button']:has-text('Add Time')"),
     ]
 
     clicked = False
@@ -522,12 +547,18 @@ def renew_server(page, server_url: str) -> tuple[str, str]:
             btn = group.nth(i)
             try:
                 if btn.is_visible() and btn.is_enabled():
-                    text = btn.inner_text().strip()
+                    text = " ".join(btn.inner_text().split())
                     if re.search(r"upgrade|premium", text, re.I):
                         continue
                     print(f"[INFO] [{server_id}] 找到续费按钮: '{text}'，准备点击...")
+                    dismiss_cookie_banners(page)
                     btn.scroll_into_view_if_needed()
-                    btn.click(timeout=10000)
+                    try:
+                        btn.click(timeout=6000)
+                    except Exception as click_err:
+                        print(f"[WARN] 常规点击被拦截，清理遮罩后强制点击: {click_err}")
+                        dismiss_cookie_banners(page)
+                        btn.click(force=True, timeout=6000)
                     clicked = True
                     break
             except Exception as e:
@@ -545,10 +576,12 @@ def renew_server(page, server_url: str) -> tuple[str, str]:
     page.wait_for_timeout(5000)
     dismiss_cookie_banners(page)
     after_timer = extract_timer_text(page)
+    in_cooldown = page.locator("text=/RENEWAL\\s*COOLDOWN/i").count() > 0
     shot = os.path.join(SCREENSHOT_DIR, f"{server_id}_renewed.png")
     page.screenshot(path=shot, full_page=False)
 
-    msg = f"✅ [{server_id}] 续费已触发！剩余时间: {before_timer} -> {after_timer}"
+    status_note = "（已进入冷却期）" if in_cooldown else ""
+    msg = f"✅ [{server_id}] 续费成功！剩余时间: {before_timer} -> {after_timer}{status_note}"
     print(f"[INFO] {msg}")
     return msg, shot
 
@@ -587,9 +620,7 @@ def main():
                 viewport={"width": 1280, "height": 900},
                 user_agent=USER_AGENT,
             )
-            context.add_init_script(
-                "Object.defineProperty(navigator, 'webdriver', {get: () => undefined})"
-            )
+            context.add_init_script(BLOCK_CMP_INIT_SCRIPT)
             page = context.new_page()
 
             try:
