@@ -8,7 +8,7 @@ on:
 
 jobs:
   renew:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 10
 
     steps:
@@ -21,13 +21,6 @@ jobs:
           python-version: "3.11"
           cache: "pip"
 
-      - name: Cache Playwright browsers
-        id: playwright-cache
-        uses: actions/cache@v4
-        with:
-          path: ~/.cache/ms-playwright
-          key: playwright-${{ runner.os }}-1.49.1
-
       - name: Restore & Save Session Cookies
         uses: actions/cache@v4
         with:
@@ -37,21 +30,12 @@ jobs:
             fgh-cookies-
 
       - name: Install dependencies
-        env:
-          DEBIAN_FRONTEND: noninteractive
         run: |
           pip install -r requirements.txt
-          if ! command -v ffmpeg >/dev/null 2>&1; then
-            sudo apt-get update -o Acquire::Retries=3 -o Acquire::http::Timeout=15
-            sudo env DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
-              -o Dpkg::Options::="--force-confdef" \
-              -o Dpkg::Options::="--force-confold" \
-              ffmpeg
+          # ubuntu-24.04 已预装 google-chrome，仅在未检测到时才下载 chromium
+          if ! command -v google-chrome >/dev/null 2>&1 && ! command -v google-chrome-stable >/dev/null 2>&1; then
+            patchright install chromium
           fi
-          if [ "${{ steps.playwright-cache.outputs.cache-hit }}" != "true" ]; then
-            playwright install chromium
-          fi
-          sudo env DEBIAN_FRONTEND=noninteractive "$(which playwright)" install-deps chromium
 
       - name: Install sing-box (if using hy2 proxy)
         env:
@@ -59,9 +43,9 @@ jobs:
         run: |
           if [[ "${PROXY_URL,,}" == hy2://* || "${PROXY_URL,,}" == hysteria2://* ]]; then
             echo "检测到 hy2 代理，正在安装 sing-box..."
-            SB_TAG=$(curl -fsSL -o /dev/null -w '%{url_effective}' https://github.com/SagerNet/sing-box/releases/latest | awk -F'/tag/' '{print $2}')
+            SB_TAG=$(curl -fsSL --retry 3 --connect-timeout 15 --max-time 30 -o /dev/null -w '%{url_effective}' https://github.com/SagerNet/sing-box/releases/latest | awk -F'/tag/' '{print $2}')
             SB_VER="${SB_TAG#v}"
-            curl -fsSL "https://github.com/SagerNet/sing-box/releases/download/${SB_TAG}/sing-box-${SB_VER}-linux-amd64.tar.gz" -o /tmp/sing-box.tar.gz
+            curl -fsSL --retry 3 --connect-timeout 15 --max-time 60 "https://github.com/SagerNet/sing-box/releases/download/${SB_TAG}/sing-box-${SB_VER}-linux-amd64.tar.gz" -o /tmp/sing-box.tar.gz
             tar -xzf /tmp/sing-box.tar.gz -C /tmp
             sudo mv "/tmp/sing-box-${SB_VER}-linux-amd64/sing-box" /usr/local/bin/sing-box
             sudo chmod +x /usr/local/bin/sing-box
@@ -78,7 +62,12 @@ jobs:
           TG_BOT_TOKEN: ${{ secrets.TG_BOT_TOKEN }}
           TG_CHAT_ID: ${{ secrets.TG_CHAT_ID }}
           TG_ALWAYS_NOTIFY: ${{ vars.TG_ALWAYS_NOTIFY || '0' }}
-        run: python renew.py
+        run: |
+          if command -v xvfb-run >/dev/null 2>&1; then
+            xvfb-run --auto-servernum --server-args="-screen 0 1366x900x24" python renew.py
+          else
+            python renew.py
+          fi
 
       - name: Upload Screenshots (Debug)
         if: always()
