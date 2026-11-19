@@ -1,0 +1,56 @@
+name: FreeGameHost Auto Renew
+
+on:
+  schedule:
+    # 每 2 小时执行一次（若想更稳改为每 1 小时，写成 "20 * * * *"）
+    - cron: "15 */2 * * *"
+  workflow_dispatch:
+
+jobs:
+  renew:
+    runs-on: ubuntu-latest
+    timeout-minutes: 8
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: "pip"
+
+      - name: Cache Playwright browsers
+        id: playwright-cache
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/ms-playwright
+          key: playwright-${{ runner.os }}-1.49.1
+
+      - name: Install dependencies
+        run: |
+          pip install -r requirements.txt
+          if [ "${{ steps.playwright-cache.outputs.cache-hit }}" != "true" ]; then
+            playwright install chromium
+          fi
+          playwright install-deps chromium
+
+      - name: Run FreeGameHost Auto Renew
+        env:
+          FGH_USERNAME: ${{ secrets.FGH_USERNAME }}
+          FGH_PASSWORD: ${{ secrets.FGH_PASSWORD }}
+          FGH_SERVER_IDS: ${{ secrets.FGH_SERVER_IDS }}
+          PROXY_URL: ${{ secrets.PROXY_URL }}
+          TG_BOT_TOKEN: ${{ secrets.TG_BOT_TOKEN }}
+          TG_CHAT_ID: ${{ secrets.TG_CHAT_ID }}
+          TG_ALWAYS_NOTIFY: ${{ vars.TG_ALWAYS_NOTIFY || '0' }}
+        run: python renew.py
+
+      - name: Upload Screenshots (Debug)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: renew-screenshots
+          path: screenshots/
+          retention-days: 3
